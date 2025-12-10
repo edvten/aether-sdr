@@ -1,0 +1,11 @@
+# Output dir
+build/
+
+# Executables
+aether-sdr
+
+# Syncthing
+.stfolder
+
+# Notes
+*.org
