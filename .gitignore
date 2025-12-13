@@ -9,3 +9,6 @@ aether-sdr
 
 # Notes
 *.org
+
+# Output files
+*.raw
