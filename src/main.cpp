@@ -1,13 +1,21 @@
+#include "SPSCQueue.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
 #include <exception>
 #include <fstream>
+#include <ios>
 #include <iostream>
 #include <rtl-sdr.h>
 #include <stdexcept>
+#include <thread>
 #include <vector>
+
+// Global flag to stop execution of threads
+std::atomic<bool> running(true);
 
 class SdrDevice {
 public:
@@ -15,13 +23,13 @@ public:
     if (rtlsdr_open(&dev, index) != 0) {
       throw std::runtime_error("Failed to open RTL-SDR device.");
     }
-    std::cout << "Device opened successfully.\n";
+    std::cerr << "Device opened successfully.\n";
   }
 
   ~SdrDevice() {
     if (dev) {
       rtlsdr_close(dev);
-      std::cout << "Device closed safely.\n";
+      std::cerr << "Device closed safely.\n";
     }
   }
 
@@ -76,7 +84,7 @@ private:
   const int DECIMATION_RATE = 40;
 
   // constant for de-emphasis in europe
-  const float alpha = 0.34;
+  const float alpha = 0.34f;
 
 public:
   AudioProcessor() {
@@ -149,7 +157,45 @@ public:
   }
 };
 
+void producer_thread(SdrDevice &sdr, SPSCQueue &queue) {
+  std::vector<uint8_t> buffer(SdrDevice::BUF_SIZE);
+
+  while (running) {
+    sdr.read_sync(buffer);
+
+    while (running && !queue.push(buffer)) {
+      // Naive busy wait
+      // Sleep to make it less naive
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  }
+}
+void consumer_thread(AudioProcessor &AP, SPSCQueue &queue) {
+  std::vector<uint8_t> buffer(SdrDevice::BUF_SIZE);
+  buffer.reserve(SdrDevice::BUF_SIZE);
+
+  while (running) {
+    if (queue.pop(buffer, SdrDevice::BUF_SIZE)) {
+      std::vector<int16_t> audio = AP.process(buffer);
+
+      // Write to stdout
+      std::cout.write(reinterpret_cast<const char *>(audio.data()),
+                      audio.size() * sizeof(int16_t));
+
+    } else {
+      // Queue empty
+      // Naive sleep to save CPU
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+}
+
 int main() {
+  // Don't sync with C output streams
+  std::ios_base::sync_with_stdio(false);
+  // Do not automatically flush output buffer when accessing stdin
+  std::cin.tie(NULL);
+
   SdrDevice sdr(0);
 
   int sample_rate = 1920000; // 1.92 MHz
@@ -158,35 +204,23 @@ int main() {
 
   sdr.configure(sample_rate, frequency, gain_db);
 
-  float seconds_to_record = 10.0f;
-  // Each sample contains two bytes (IQ)
-  long long total_bytes_needed =
-      (long long)(sample_rate * 2 * seconds_to_record);
-
-  // This ensures that we allocate enough OR more space in our buffer
-  // Only doing total_bytes_needed / SdrDevice::BUF_SIZE could mean
-  // that we don't allocate enough space
-  int buffer_ratio =
-      (total_bytes_needed + SdrDevice::BUF_SIZE - 1) / SdrDevice::BUF_SIZE;
-
-  std::vector<uint8_t> intermediate_buffer(SdrDevice::BUF_SIZE);
-  std::vector<uint8_t> buffer;
-  buffer.reserve(SdrDevice::BUF_SIZE * buffer_ratio);
-
-  for (int i = 0; i < buffer_ratio; i++) {
-    sdr.read_sync(intermediate_buffer);
-    buffer.insert(buffer.end(), intermediate_buffer.begin(),
-                  intermediate_buffer.end());
-  }
-
   AudioProcessor AP;
-  std::vector<int16_t> audio = AP.process(buffer);
 
-  std::ofstream out_file;
-  out_file.open("radio_output.raw", std::ios::binary);
+  SPSCQueue queue(1 << 20);
 
-  out_file.write(reinterpret_cast<const char *>(audio.data()),
-                 audio.size() * sizeof(int16_t));
-  out_file.close();
+  std::cerr << "Starting producer and consumer threads... \n"
+            << "Press enter to stop.\n";
+
+  std::thread prod(producer_thread, std::ref(sdr), std::ref(queue));
+  std::thread cons(consumer_thread, std::ref(AP), std::ref(queue));
+
+  // Wait for user input
+  std::cin.get();
+
+  running = false;
+
+  prod.join();
+  cons.join();
+
   return 0;
 }
