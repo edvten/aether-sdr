@@ -18,17 +18,24 @@ The application uses a **Producer-Consumer** architecture to separate the hardwa
 * **aplay** (or any raw audio player for playback)
 * **C++17 compliant compiler** (GCC/Clang)
 
+## Building
+
+```bash
+make
+```
+
 ## Running
 
 The program outputs raw audio data (16-bit signed, Little Endian, Mono) to standard output. 
 
-With the default input sampling rate (1.92 MHz), the resulting audio rate is 48 KHz.
+The target audio rate is 48 KHz.
 
 To play the audio you must pipe it to an audio player:
 
 ```bash
-# By default it is tuned to 98.4 MHz
-./aether-sdr | aplay -r 48000 -f S16_LE -t raw -c 1
+# Sample rate set to 1.92 MHz, frequency 95.7 MHz, gain 40 dB
+# Defaults are 1.92 MHz, 98.4 MHz and 35 dB
+./aether-sdr -s 1.92 -f 95.7 -g 40 | aplay -r 48000 -f S16_LE -t raw -c 1
 ```
 
 ## License

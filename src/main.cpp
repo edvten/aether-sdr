@@ -5,17 +5,22 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <ios>
 #include <iostream>
 #include <rtl-sdr.h>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 // Global flag to stop execution of threads
 std::atomic<bool> running(true);
+
+static constexpr int TARGET_AUDIO_RATE = 48000;
 
 class SdrDevice {
 public:
@@ -34,7 +39,6 @@ public:
   }
 
   // Disabling copy constructors to avoid double-free
-  // https://www.geeksforgeeks.org/cpp/explicitly-defaulted-deleted-functions-c-11/
   SdrDevice(const SdrDevice &) = delete;
   SdrDevice &operator=(const SdrDevice &) = delete;
 
@@ -71,37 +75,32 @@ private:
 };
 
 class AudioProcessor {
-private:
-  // Previous IQ sample
-  std::complex<float> prev_sample;
-  // Previous De-emphasised sample
-  float previous_filtered_sample;
-
-  // Decimation moving average variables
-  int decimation_counter;
-  float decimation_sum;
-  // Based on sample rate 1.92 MHz and audio sample rate 48KHz
-  const int DECIMATION_RATE = 40;
-
-  // constant for de-emphasis in europe
-  const float alpha = 0.34f;
-
 public:
-  AudioProcessor() {
-    prev_sample = std::complex<float>(1.0f, 0.0);
-    previous_filtered_sample = 0.0f;
+  AudioProcessor(int decimation_rate)
+      : decimation_counter(0), decimation_sum(0.0f),
+        decimation_rate(decimation_rate),
+        prev_sample(std::complex<float>(1.0f, 0.0f)),
+        previous_filtered_sample(0.0f) {
 
-    // Simple moving average (boxcar) filter initialisation
-    decimation_counter = 0;
-    decimation_sum = 0.0f;
+    // Calculations of alpha based on:
+    // https://en.wikipedia.org/wiki/Low-pass_filter#Discrete-time_realization
+    // Which links to:
+    // https://en.wikipedia.org/wiki/Exponential_smoothing#Time_constant
+    // Giving us the formula used below.
+    // 50 micro seconds is the default time-constant in Europe:
+    // https://www.fmradiobroadcast.com/article/detail/fm-emphasis.html
+    const float time_constant = 50e-6f;
+    float dt = 1.0f / TARGET_AUDIO_RATE;
+    alpha = 1.0f - std::exp(-dt / time_constant);
   }
+
   std::vector<int16_t> process(const std::vector<uint8_t> &raw_iq) {
     // IQ sampling gives us the factor 2.
-    // We accumulate DECIMATION_RATE samples and filter them to become 1
+    // We accumulate decimation_rate samples and filter them to become 1
     // Hence our output buffer is smaller than the input buffer by a factor of
-    // (2 * DECIMATION_RATE)
+    // (2 * decimation_rate)
     std::vector<int16_t> output_buffer;
-    output_buffer.reserve(raw_iq.size() / (2 * DECIMATION_RATE));
+    output_buffer.reserve(raw_iq.size() / (2 * decimation_rate));
 
     // Note i += 2 since we jump from I sample to I sample
     for (size_t i = 0; i < raw_iq.size(); i += 2) {
@@ -128,10 +127,10 @@ public:
       decimation_sum += delta_phase;
       decimation_counter++;
 
-      // If we have collected DECIMATION_RATE samples
-      if (decimation_counter == DECIMATION_RATE) {
+      // If we have collected decimation_rate samples
+      if (decimation_counter == decimation_rate) {
         // Calculate the average value
-        float audio_sample = decimation_sum / (float)DECIMATION_RATE;
+        float audio_sample = decimation_sum / (float)decimation_rate;
 
         // Reset decimation counters and sum
         decimation_counter = 0;
@@ -155,6 +154,18 @@ public:
 
     return output_buffer;
   }
+
+private:
+  // Decimation moving average variables
+  int decimation_counter;
+  float decimation_sum;
+  int decimation_rate;
+  // Previous IQ sample
+  std::complex<float> prev_sample;
+  // Previous De-emphasised sample
+  float previous_filtered_sample;
+  // constant for de-emphasis in europe
+  float alpha;
 };
 
 void producer_thread(SdrDevice &sdr, SPSCQueue &queue) {
@@ -190,37 +201,95 @@ void consumer_thread(AudioProcessor &AP, SPSCQueue &queue) {
   }
 }
 
-int main() {
+void print_help() {
+  std::cerr << "Usage: aether-sdr [OPTIONS]\n"
+            << "\n"
+            << "Options:\n"
+            << "  -h Show this help message\n"
+            << "  -s <sample rate (MHz)> Set the sample rate\n"
+            << "  -f <frequency (MHz)> Set the frequency\n"
+            << "  -g <gain(dB)> Set the tuner gain\n";
+}
+
+int main(int argc, char *argv[]) {
   // Don't sync with C output streams
   std::ios_base::sync_with_stdio(false);
   // Do not automatically flush output buffer when accessing stdin
   std::cin.tie(NULL);
 
-  SdrDevice sdr(0);
-
+  // Defaults
   int sample_rate = 1920000; // 1.92 MHz
   int frequency = 98400000;  // 98.4 MHz
   int gain_db = 35;          // 35 db
 
-  sdr.configure(sample_rate, frequency, gain_db);
+  int opt;
+  while ((opt = getopt(argc, argv, "hs:f:g:")) != -1) {
+    switch (opt) {
+    case 'h':
+      print_help();
+      return 0;
+      break;
+    case 's':
+      // We expect sample rate in MHz
+      // Add 0.5f to fix truncation
+      sample_rate = static_cast<int>(std::round(std::stof(optarg) * 1e6));
+      std::cerr << "Set sample rate to: " << sample_rate << " Hz\n";
+      break;
+    case 'f':
+      // Expect frequency in MHz
+      // Add 0.5f to fix truncation
+      frequency = static_cast<int>(std::round(std::stof(optarg) * 1e6));
+      std::cerr << "Set frequency to: " << frequency << " Hz\n";
+      break;
+    case 'g':
+      // We expect integer gains
+      gain_db = std::stoi(optarg);
+      std::cerr << "Set gain to: " << gain_db << " dB\n";
+      break;
+    default:
+      print_help();
+      return 1;
+    }
+  }
 
-  AudioProcessor AP;
+  int decimation_rate = sample_rate / TARGET_AUDIO_RATE;
 
-  SPSCQueue queue(1 << 20);
+  if (decimation_rate < 1)
+    decimation_rate = 1;
+  if (sample_rate % TARGET_AUDIO_RATE != 0) {
+    std::cerr << "Warning: Sample rate " << sample_rate
+              << " Hz is not a multiple of " << TARGET_AUDIO_RATE << " Hz. \n"
+              << "Audio will technically play at "
+              << (sample_rate / decimation_rate)
+              << " Hz but calculations are based on " << TARGET_AUDIO_RATE
+              << " Hz\n";
+  }
 
-  std::cerr << "Starting producer and consumer threads... \n"
-            << "Press enter to stop.\n";
+  try {
+    SdrDevice sdr(0);
+    sdr.configure(sample_rate, frequency, gain_db);
 
-  std::thread prod(producer_thread, std::ref(sdr), std::ref(queue));
-  std::thread cons(consumer_thread, std::ref(AP), std::ref(queue));
+    AudioProcessor AP(decimation_rate);
 
-  // Wait for user input
-  std::cin.get();
+    SPSCQueue queue(1 << 20);
 
-  running = false;
+    std::cerr << "Starting producer and consumer threads... \n"
+              << "Press enter to stop.\n";
 
-  prod.join();
-  cons.join();
+    std::thread prod(producer_thread, std::ref(sdr), std::ref(queue));
+    std::thread cons(consumer_thread, std::ref(AP), std::ref(queue));
+
+    // Wait for user input
+    std::cin.get();
+
+    running = false;
+
+    prod.join();
+    cons.join();
+  } catch (const std::exception &e) {
+    std::cerr << "ERROR: " << e.what() << "\n";
+    return 1;
+  }
 
   return 0;
 }
