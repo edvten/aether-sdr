@@ -1,13 +1,17 @@
+#include "../include/miniaudio.h"
 #include "SPSCQueue.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
-#include <fstream>
+#include <functional>
 #include <ios>
 #include <iostream>
 #include <rtl-sdr.h>
@@ -28,13 +32,13 @@ public:
     if (rtlsdr_open(&dev, index) != 0) {
       throw std::runtime_error("Failed to open RTL-SDR device.");
     }
-    std::cerr << "Device opened successfully.\n";
+    std::cout << "Device opened successfully.\n";
   }
 
   ~SdrDevice() {
     if (dev) {
       rtlsdr_close(dev);
-      std::cerr << "Device closed safely.\n";
+      std::cout << "Device closed safely.\n";
     }
   }
 
@@ -43,13 +47,33 @@ public:
   SdrDevice &operator=(const SdrDevice &) = delete;
 
   void configure(int sample_rate, int frequency, int gain_db) {
-    rtlsdr_set_sample_rate(dev, sample_rate);
-    rtlsdr_set_center_freq(dev, frequency);
-    rtlsdr_set_tuner_gain_mode(dev, 1);       // Manual Gain
-    rtlsdr_set_tuner_gain(dev, gain_db * 10); // Gain is given by tenths of db
+    int r;
+    std::cout << "Configuring SDR...\n";
 
-    // Clear buffer
-    rtlsdr_reset_buffer(dev);
+    r = rtlsdr_set_sample_rate(dev, sample_rate);
+    if (r < 0)
+      throw std::runtime_error("Failed to set sample rate");
+
+    // Give PLL time to lock
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    r = rtlsdr_set_tuner_gain_mode(dev, 1);
+    if (r < 0)
+      throw std::runtime_error("Failed to enable manual gain");
+
+    r = rtlsdr_set_tuner_gain(dev, gain_db * 10);
+    if (r < 0)
+      std::cerr << "Warning: Failed to set tuner gain.\n";
+
+    r = rtlsdr_set_center_freq(dev, frequency);
+    if (r < 0)
+      throw std::runtime_error("Failed to set frequency");
+
+    r = rtlsdr_reset_buffer(dev);
+    if (r < 0)
+      throw std::runtime_error("Failed to reset buffer");
+
+    std::cout << "Configuration complete.\n";
   }
 
   void read_sync(std::vector<uint8_t> &buffer) {
@@ -181,28 +205,9 @@ void producer_thread(SdrDevice &sdr, SPSCQueue &queue) {
     }
   }
 }
-void consumer_thread(AudioProcessor &AP, SPSCQueue &queue) {
-  std::vector<uint8_t> buffer(SdrDevice::BUF_SIZE);
-  buffer.reserve(SdrDevice::BUF_SIZE);
-
-  while (running) {
-    if (queue.pop(buffer, SdrDevice::BUF_SIZE)) {
-      std::vector<int16_t> audio = AP.process(buffer);
-
-      // Write to stdout
-      std::cout.write(reinterpret_cast<const char *>(audio.data()),
-                      audio.size() * sizeof(int16_t));
-
-    } else {
-      // Queue empty
-      // Naive sleep to save CPU
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-}
 
 void print_help() {
-  std::cerr << "Usage: aether-sdr [OPTIONS]\n"
+  std::cout << "Usage: aether-sdr [OPTIONS]\n"
             << "\n"
             << "Options:\n"
             << "  -h Show this help message\n"
@@ -211,12 +216,63 @@ void print_help() {
             << "  -g <gain(dB)> Set the tuner gain\n";
 }
 
-int main(int argc, char *argv[]) {
-  // Don't sync with C output streams
-  std::ios_base::sync_with_stdio(false);
-  // Do not automatically flush output buffer when accessing stdin
-  std::cin.tie(NULL);
+struct AudioContext {
+  AudioProcessor *AP;
+  SPSCQueue *queue;
+  int decimation_rate;
 
+  std::vector<uint8_t> buffer;
+};
+
+void data_callback(ma_device *pDevice, void *pOutput, const void *pInput,
+                   ma_uint32 frameCount) {
+  auto *ctx = static_cast<AudioContext *>(pDevice->pUserData);
+
+  // Number of audio_samples needed (frameCount) * raw radio samples to audio
+  // samples factor (decimation rate) * 2 (IQ sampling)
+  size_t bytes_to_read = frameCount * ctx->decimation_rate * 2;
+
+  ctx->buffer.resize(bytes_to_read);
+
+  // Get raw IQ samples
+  size_t bytes_read = ctx->queue->pop(&ctx->buffer[0], bytes_to_read);
+
+  if (bytes_read < bytes_to_read) {
+    std::memset(&ctx->buffer[bytes_read], 127, bytes_to_read - bytes_read);
+  }
+  
+  // Process the raw IQ to audio
+  std::vector<int16_t> audio = ctx->AP->process(ctx->buffer);
+
+  // These should match
+  assert(audio.size() == frameCount);
+
+  int16_t *output_buffer = static_cast<int16_t *>(pOutput);
+  std::memcpy(output_buffer, audio.data(), frameCount * sizeof(int16_t));
+
+  // Remove unused warning from compiler
+  (void)pInput;
+}
+
+void init_miniaudio(ma_device *MA, ma_device_data_proc data_callback,
+                    AudioContext *ctx) {
+  ma_device_config config = ma_device_config_init(ma_device_type_playback);
+  config.playback.format = ma_format_s16; // int16_t
+  config.playback.channels = 1;           // Mono audio
+  config.sampleRate = TARGET_AUDIO_RATE;
+  config.dataCallback = data_callback;
+  config.pUserData = ctx;
+
+  if (ma_device_init(NULL, &config, MA) != MA_SUCCESS) {
+    throw std::runtime_error("Failed to init miniaudio device");
+  }
+
+  ma_device_set_master_volume(MA, 1.0f);
+
+  ma_device_start(MA);
+}
+
+int main(int argc, char *argv[]) {
   // Defaults
   int sample_rate = 1920000; // 1.92 MHz
   int frequency = 98400000;  // 98.4 MHz
@@ -233,18 +289,18 @@ int main(int argc, char *argv[]) {
       // We expect sample rate in MHz
       // Add 0.5f to fix truncation
       sample_rate = static_cast<int>(std::round(std::stof(optarg) * 1e6));
-      std::cerr << "Set sample rate to: " << sample_rate << " Hz\n";
+      std::cout << "Set sample rate to: " << sample_rate << " Hz\n";
       break;
     case 'f':
       // Expect frequency in MHz
       // Add 0.5f to fix truncation
       frequency = static_cast<int>(std::round(std::stof(optarg) * 1e6));
-      std::cerr << "Set frequency to: " << frequency << " Hz\n";
+      std::cout << "Set frequency to: " << frequency << " Hz\n";
       break;
     case 'g':
       // We expect integer gains
       gain_db = std::stoi(optarg);
-      std::cerr << "Set gain to: " << gain_db << " dB\n";
+      std::cout << "Set gain to: " << gain_db << " dB\n";
       break;
     default:
       print_help();
@@ -272,20 +328,28 @@ int main(int argc, char *argv[]) {
     AudioProcessor AP(decimation_rate);
 
     SPSCQueue queue(1 << 20);
+    AudioContext ctx;
+    ctx.AP = &AP;
+    ctx.queue = &queue;
+    ctx.decimation_rate = decimation_rate;
 
-    std::cerr << "Starting producer and consumer threads... \n"
-              << "Press enter to stop.\n";
+    std::cout << "Starting producer thread... \n";
 
     std::thread prod(producer_thread, std::ref(sdr), std::ref(queue));
-    std::thread cons(consumer_thread, std::ref(AP), std::ref(queue));
+    std::cout << "Buffering data... \n";
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::cout << "Starting Audio. \n";
+    std::cout << "Press enter to stop.\n";
+    ma_device MA;
+    init_miniaudio(&MA, data_callback, &ctx);
 
     // Wait for user input
     std::cin.get();
 
+    ma_device_uninit(&MA);
     running = false;
 
     prod.join();
-    cons.join();
   } catch (const std::exception &e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return 1;

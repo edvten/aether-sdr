@@ -10,12 +10,12 @@ The application uses a **Producer-Consumer** architecture to separate the hardwa
 
 * **Producer Thread:** Reads raw IQ samples from the RTL-SDR dongle via USB.
 * **SPSC Queue:** A custom, lock-free Single-Producer Single-Consumer FIFO queue passes data between threads without mutex locking.
-* **Consumer Thread:** Performs demodulation, filtering, and de-emphasis, then writes raw audio samples to `stdout`.
+* **Audio Callback (Consumer):** Managed by the `miniaudio` backend. It wakes up periodically, fetches raw data from the queue, demodulates it, and fills the system audio buffer in real-time.
 
 ## Dependencies
 
 * **librtlsdr** (Driver for the USB dongle)
-* **aplay** (or any raw audio player for playback)
+* **miniaudio** (Included as a single-header library)
 * **C++17 compliant compiler** (GCC/Clang)
 
 ## Building
@@ -26,16 +26,13 @@ make
 
 ## Running
 
-The program outputs raw audio data (16-bit signed, Little Endian, Mono) to standard output. 
-
 The target audio rate is 48 KHz.
-
-To play the audio you must pipe it to an audio player:
 
 ```bash
 # Sample rate set to 1.92 MHz, frequency 95.7 MHz, gain 40 dB
+./aether-sdr -s 1.92 -f 95.7 -g 40
 # Defaults are 1.92 MHz, 98.4 MHz and 35 dB
-./aether-sdr -s 1.92 -f 95.7 -g 40 | aplay -r 48000 -f S16_LE -t raw -c 1
+./aether-sdr
 ```
 
 ## License

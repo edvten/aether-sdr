@@ -79,6 +79,33 @@ public:
     return true;
   }
 
+  size_t pop(uint8_t *dest_ptr, size_t max_size) {
+    auto curr_head = head.load(std::memory_order_acquire);
+    auto curr_tail = tail.load(std::memory_order_relaxed);
+
+    if (curr_head == curr_tail) {
+      return -1; // Queue empty
+    }
+
+    size_t read_size = std::min(max_size, curr_head - curr_tail);
+    size_t read_index = curr_tail & mask;
+    size_t first_chunk = std::min(read_size, buf_size - read_index);
+
+    // Read until we have read all data we want or until we hit the end of the
+    // Buffer
+    std::memcpy(dest_ptr, buffer.data() + read_index, first_chunk);
+
+    // Check if we hit the end of the buffer
+    if (first_chunk < read_size) {
+      // Copy from start of buffer to correct offset into destination
+      std::memcpy(dest_ptr + first_chunk, buffer.data(),
+                  read_size - first_chunk);
+    }
+
+    tail.store(curr_tail + read_size, std::memory_order_release);
+    return read_size;
+  }
+
 private:
   std::vector<uint8_t> buffer;
   std::size_t buf_size;
