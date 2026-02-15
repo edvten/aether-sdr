@@ -6,15 +6,18 @@ This is a hobby project I created to learn more about C++, multithreading, and D
 
 ## Architecture
 
-The application uses a **Producer-Consumer** architecture to separate the hardware reading from the signal processing:
+The application uses a **Forked Producer-Consumer** architecture to separate the hardware reading from the signal processing:
 
-* **Producer Thread:** Reads raw IQ samples from the RTL-SDR dongle via USB.
-* **SPSC Queue:** A custom, lock-free Single-Producer Single-Consumer FIFO queue passes data between threads without mutex locking.
-* **Audio Callback (Consumer):** Managed by the `miniaudio` backend. It wakes up periodically, fetches raw data from the queue, demodulates it, and fills the system audio buffer in real-time.
+* **Producer Thread:** Reads raw IQ samples from the RTL-SDR dongle via USB. It pushes data to two separate queues:
+    * **Audio Queue (Critical):** Blocking. If full, the producer waits to ensure no audio samples are lost.
+    * **GUI Queue (Lossy):** Non-blocking. If full, packets are dropped to ensure the visualization never stalls the audio.
+* **Audio Callback (Consumer):** Managed by `miniaudio`. It wakes up periodically to demodulate data and fill the system audio buffer in real-time.
+* **Visualizer:** Uses **Raylib** to render the raw signal data.
 
 ## Dependencies
 
 * **librtlsdr** (Driver for the USB dongle)
+* **libraylib-dev** (Graphics library for the visualizer)
 * **miniaudio** (Included as a single-header library)
 * **C++17 compliant compiler** (GCC/Clang)
 
@@ -26,7 +29,7 @@ make
 
 ## Running
 
-The target audio rate is 48 KHz.
+The program opens a GUI window displaying the raw signal and outputs audio to the default device.
 
 ```bash
 # Sample rate set to 1.92 MHz, frequency 95.7 MHz, gain 40 dB

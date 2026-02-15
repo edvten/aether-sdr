@@ -1,4 +1,5 @@
 #include "../include/miniaudio.h"
+#include "GUIWindow.hpp"
 #include "SPSCQueue.hpp"
 #include <algorithm>
 #include <atomic>
@@ -12,8 +13,8 @@
 #include <cstring>
 #include <exception>
 #include <functional>
-#include <ios>
 #include <iostream>
+#include <numeric>
 #include <rtl-sdr.h>
 #include <stdexcept>
 #include <string>
@@ -192,18 +193,35 @@ private:
   float alpha;
 };
 
-void producer_thread(SdrDevice &sdr, SPSCQueue &queue) {
+void producer_thread(SdrDevice &sdr, SPSCQueue &audio_queue,
+                     SPSCQueue &gui_queue) {
   std::vector<uint8_t> buffer(SdrDevice::BUF_SIZE);
 
   while (running) {
     sdr.read_sync(buffer);
 
-    while (running && !queue.push(buffer)) {
+    while (running && !audio_queue.push(buffer)) {
       // Naive busy wait
       // Sleep to make it less naive
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
+
+    gui_queue.push(buffer);
   }
+}
+
+void gui_thread_func(SPSCQueue &gui_queue) {
+  GUIWindow window(1024, 600, "Aether SDR");
+
+  std::vector<uint8_t> buffer(1024);
+
+  while (running && !window.should_close()) {
+    size_t bytes_read = gui_queue.pop(buffer.data(), buffer.size());
+    window.draw(buffer, bytes_read);
+  }
+
+  // Terminate all other threads if window is closed
+  running = false;
 }
 
 void print_help() {
@@ -240,7 +258,7 @@ void data_callback(ma_device *pDevice, void *pOutput, const void *pInput,
   if (bytes_read < bytes_to_read) {
     std::memset(&ctx->buffer[bytes_read], 127, bytes_to_read - bytes_read);
   }
-  
+
   // Process the raw IQ to audio
   std::vector<int16_t> audio = ctx->AP->process(ctx->buffer);
 
@@ -327,15 +345,22 @@ int main(int argc, char *argv[]) {
 
     AudioProcessor AP(decimation_rate);
 
-    SPSCQueue queue(1 << 20);
+    SPSCQueue audio_queue(1 << 20);
     AudioContext ctx;
     ctx.AP = &AP;
-    ctx.queue = &queue;
+    ctx.queue = &audio_queue;
     ctx.decimation_rate = decimation_rate;
+
+    size_t max_buffer_bytes = 16384 * decimation_rate * 2;
+    ctx.buffer.reserve(max_buffer_bytes);
+
+    SPSCQueue gui_queue(1 << 20);
 
     std::cout << "Starting producer thread... \n";
 
-    std::thread prod(producer_thread, std::ref(sdr), std::ref(queue));
+    std::thread prod(producer_thread, std::ref(sdr), std::ref(audio_queue),
+                     std::ref(gui_queue));
+
     std::cout << "Buffering data... \n";
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     std::cout << "Starting Audio. \n";
@@ -343,13 +368,10 @@ int main(int argc, char *argv[]) {
     ma_device MA;
     init_miniaudio(&MA, data_callback, &ctx);
 
-    // Wait for user input
-    std::cin.get();
+    gui_thread_func(gui_queue);
+    prod.join();
 
     ma_device_uninit(&MA);
-    running = false;
-
-    prod.join();
   } catch (const std::exception &e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return 1;
