@@ -6,15 +6,17 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+// Include complex before fftw3 makes it use the complex type instead of
+// defining it's own. (TODO: This doesn't seem to work)
 #include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fftw3.h>
 #include <functional>
 #include <iostream>
-#include <numeric>
 #include <rtl-sdr.h>
 #include <stdexcept>
 #include <string>
@@ -26,6 +28,7 @@
 std::atomic<bool> running(true);
 
 static constexpr int TARGET_AUDIO_RATE = 48000;
+static constexpr int FFT_N = 1024;
 
 class SdrDevice {
 public:
@@ -210,18 +213,99 @@ void producer_thread(SdrDevice &sdr, SPSCQueue &audio_queue,
   }
 }
 
-void gui_thread_func(SPSCQueue &gui_queue) {
-  GUIWindow window(1024, 600, "Aether SDR");
+void FFT_init(fftwf_complex *&in, fftwf_complex *&out, fftwf_plan *p) {
+  // Malloc memory for in/out buffers
+  in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * FFT_N);
+  out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * FFT_N);
 
-  std::vector<uint8_t> buffer(1024);
+  // Create FFT plan
+  // "In short, if your program performs many transforms of the same size
+  // and initialization time is not important, use FFTW_MEASURE;
+  // otherwise use the FFTW_ESTIMATE."
+  *p = fftwf_plan_dft_1d(FFT_N, in, out, FFTW_FORWARD, FFTW_MEASURE);
+}
+
+void FFT_deinit(fftwf_complex *&in, fftwf_complex *&out, fftwf_plan *p) {
+  fftwf_destroy_plan(*p);
+
+  fftwf_free(in);
+  fftwf_free(out);
+}
+
+void FFT_helper(const std::vector<uint8_t> &raw_iq, fftwf_complex *in,
+                fftwf_complex *out, std::vector<float> &magnitudes,
+                fftwf_plan *p) {
+  // Move IQ into fftw input buffer
+  for (size_t i = 0; i < raw_iq.size(); i += 2) {
+    // Hann window factor
+    float w_n = 0.5f * (1.0f - cosf(2 * M_PI * i / (FFT_N - 1)));
+
+    // Raw IQ to real/imag
+    float real = ((float)raw_iq[i] - 127.5f) / 127.5f;
+    float imag = ((float)raw_iq[i + 1] - 127.5f) / 127.5f;
+    // in[fft_sample_no] = std::complex<float>(raw_iq[i], raw_iq[i + 1]);
+    // Do we need to do typecasting for the indexing?
+    in[i / 2][0] = real * w_n;
+    in[i / 2][1] = imag * w_n;
+  }
+  // Perform FFT
+  fftwf_execute(*p);
+
+  // Compute magnitude of output
+  for (size_t i = 0; i < FFT_N; i++) {
+    // Get complex result
+    float real = out[i][0];
+    float imag = out[i][1];
+
+    // Compute magnitude in dB (add 1.0e-9f to avoid log(0) errors)
+    float magnitude =
+        10.0f * log10f(sqrtf(real * real + imag * imag) + 1.0e-9f);
+    magnitudes[i] = magnitude;
+  }
+
+  // Perform fft-shift
+  std::vector<float>::iterator middle =
+      magnitudes.begin() + (magnitudes.size() / 2);
+  std::rotate(magnitudes.begin(), middle, magnitudes.end());
+}
+
+void gui_thread_func(SPSCQueue &gui_queue, ma_device *MA, int sample_rate,
+                     int center_freq) {
+  fftwf_complex *in = nullptr;
+  fftwf_complex *out = nullptr;
+  fftwf_plan p;
+  FFT_init(in, out, &p);
+
+  GUIWindow window(1024, 600, "Aether SDR", sample_rate, center_freq);
+
+  float volume = 1.0f;
+  float prev_volume = volume;
+  ma_device_set_master_volume(MA, volume);
+
+  // To get FFT_N complex samples we need 2 * FFT_N IQ samples
+  std::vector<uint8_t> rawIQ_buffer(2 * FFT_N);
+  // Magnitude of FFT in dB
+  std::vector<float> magnitudes(FFT_N);
 
   while (running && !window.should_close()) {
-    size_t bytes_read = gui_queue.pop(buffer.data(), buffer.size());
-    window.draw(buffer, bytes_read);
+    size_t bytes_read = gui_queue.pop(rawIQ_buffer.data(), rawIQ_buffer.size());
+    // We can only compute FFT if we received the necessary number of samples
+    if (bytes_read == rawIQ_buffer.size()) {
+      FFT_helper(rawIQ_buffer, in, out, magnitudes, &p);
+    }
+    window.draw(rawIQ_buffer, magnitudes, bytes_read, &volume);
+
+    // If volume has changed
+    if (volume != prev_volume) {
+      ma_device_set_master_volume(MA, volume);
+      prev_volume = volume;
+    }
   }
 
   // Terminate all other threads if window is closed
   running = false;
+
+  FFT_deinit(in, out, &p);
 }
 
 void print_help() {
@@ -368,7 +452,7 @@ int main(int argc, char *argv[]) {
     ma_device MA;
     init_miniaudio(&MA, data_callback, &ctx);
 
-    gui_thread_func(gui_queue);
+    gui_thread_func(gui_queue, &MA, sample_rate, frequency);
     prod.join();
 
     ma_device_uninit(&MA);

@@ -2,6 +2,8 @@
 
 A simple FM radio receiver for the RTL-SDR dongle, written in C++17.
 
+![Aether SDR Interface](screenshot.png)
+
 This is a hobby project I created to learn more about C++, multithreading, and Digital Signal Processing (DSP). It implements a basic demodulator directly on top of the `librtlsdr` driver, without relying on large frameworks like GNU Radio.
 
 ## Architecture
@@ -9,15 +11,20 @@ This is a hobby project I created to learn more about C++, multithreading, and D
 The application uses a **Forked Producer-Consumer** architecture to separate the hardware reading from the signal processing:
 
 * **Producer Thread:** Reads raw IQ samples from the RTL-SDR dongle via USB. It pushes data to two separate queues:
-    * **Audio Queue (Critical):** Blocking. If full, the producer waits to ensure no audio samples are lost.
-    * **GUI Queue (Lossy):** Non-blocking. If full, packets are dropped to ensure the visualization never stalls the audio.
+    * **Audio Queue:** Blocking. If full, the producer waits to ensure no audio samples are lost.
+    * **GUI Queue:** Non-blocking. If full, packets are dropped to ensure the visualization never stalls the audio.
 * **Audio Callback (Consumer):** Managed by `miniaudio`. It wakes up periodically to demodulate data and fill the system audio buffer in real-time.
-* **Visualizer:** Uses **Raylib** to render the raw signal data.
+* **Visualizer (Consumer):** Uses **Raylib** and **Raygui** to render the raw signal data and a real-time FFT spectrum.
+
+## Features
+* **Spectral Analysis:** Real-time FFT magnitude visualisation using `fftw3`.
+* **Interactive UI:** A volume slider that dynamically scales both audio output and time-domain visualization.
 
 ## Dependencies
 
 * **librtlsdr** (Driver for the USB dongle)
 * **libraylib-dev** (Graphics library for the visualizer)
+* **fftw3** (C library for computing discrete Fourier transforms)
 * **miniaudio** (Included as a single-header library)
 * **C++17 compliant compiler** (GCC/Clang)
 
@@ -29,8 +36,7 @@ make
 
 ## Running
 
-The program opens a GUI window displaying the raw signal and outputs audio to the default device.
-
+The program opens a GUI window displaying the raw signal, the frequency spectrum, and outputs audio to the default device.
 ```bash
 # Sample rate set to 1.92 MHz, frequency 95.7 MHz, gain 40 dB
 ./aether-sdr -s 1.92 -f 95.7 -g 40

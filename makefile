@@ -1,7 +1,9 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Iinclude -pthread
+# CXXFLAGS = -std=c++17 -Wall -Wextra -g -O0 -Iinclude -pthread
 
-LIBS = -lrtlsdr -lraylib
+# -lfftw3f since we use floats instead of doubles
+LIBS = -lrtlsdr -lraylib -lfftw3f -lm
 
 SRC_DIR = src
 BUILD_DIR = build
